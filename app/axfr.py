@@ -47,6 +47,10 @@ from dataclasses import dataclass
 
 from .models import RRset, Zone
 from .review import ReviewError
+from .wire import (
+    WireCursor,
+    parse_header,
+)
 from .zonemd import TYPE_CODES
 from .zoneparse import (
     SVCB_KNOWN_KEYS,
@@ -60,8 +64,6 @@ from .zoneparse import (
 
 QTYPE_AXFR = 252
 CLASS_IN = 1
-# 与区域文本解析一致的 31 位 TTL 上限
-MAX_TTL = 2**31 - 1
 
 # 类型号 -> 类型名（含 AXFR 查询类型，供轨迹展示）
 TYPE_NAMES = {code: name for name, code in TYPE_CODES.items()}
@@ -106,83 +108,11 @@ class AxfrFrame:
 
 
 # ---------------------------------------------------------------------------
-# 名称解压（RFC 1035 §4.1.4）
-# ---------------------------------------------------------------------------
-
-def _read_name(frame: bytes, offset: int, where: str) -> tuple[str, int]:
-    """在 ``offset`` 处读取一个（可压缩的）域名。
-
-    返回 ``(小写绝对名, 名称结束后下一偏移)``；指针成环/越界、帧内
-    截断、名称非法均抛 422。
-    """
-    labels: list[str] = []
-    pos = offset
-    end: int | None = None  # 首次跟随压缩指针后确定的“下一偏移”
-    visited: set[int] = set()  # 已跳转过的指针目标（环检测）
-    while True:
-        if pos >= len(frame):
-            raise ReviewError(
-                "frame_truncated", f"{where}：名称超出报文末尾", 422
-            )
-        length = frame[pos]
-        if length & 0xC0 == 0xC0:
-            if pos + 1 >= len(frame):
-                raise ReviewError(
-                    "frame_truncated", f"{where}：压缩指针只有半个字节", 422
-                )
-            target = ((length & 0x3F) << 8) | frame[pos + 1]
-            if target >= len(frame):
-                raise ReviewError(
-                    "compression_pointer_out_of_bounds",
-                    f"{where}：压缩指针指向报文外偏移 {target}",
-                    422,
-                )
-            if end is None:
-                end = pos + 2
-            if target in visited:
-                raise ReviewError(
-                    "compression_pointer_loop",
-                    f"{where}：压缩指针在偏移 {target} 处成环",
-                    422,
-                )
-            visited.add(target)
-            pos = target
-            continue
-        if length & 0xC0:
-            raise ReviewError(
-                "invalid_name",
-                f"{where}：非法标签类型字节 0x{length:02x}",
-                422,
-            )
-        pos += 1
-        if length == 0:
-            break
-        if pos + length > len(frame):
-            raise ReviewError(
-                "frame_truncated", f"{where}：标签超出报文末尾", 422
-            )
-        raw = frame[pos : pos + length]
-        try:
-            labels.append(raw.decode("ascii").lower())
-        except UnicodeDecodeError as exc:
-            raise ReviewError(
-                "invalid_name",
-                f"{where}：名称标签含非 ASCII 字节: {exc}",
-                422,
-            ) from exc
-        pos += length
-    name = (".".join(labels) + ".") if labels else "."
-    try:
-        validate_name(name)
-    except ZoneParseError as exc:
-        raise ReviewError(
-            "invalid_name", f"{where}：名称非法: {exc}", 422
-        ) from exc
-    return name, (end if end is not None else pos)
-
-
-# ---------------------------------------------------------------------------
 # RDATA 解析（wire -> 规范文本，与区域文本解析的规范形式一致）
+#
+# 名称解压、问题区与 RR 固定头统一由 app.wire 共享层处理；这里只解释
+# RDATA，名称一律经游标（cursor.name）读取，因此 owner 与 RDATA 内的
+# 压缩指针（可指向 RDATA 之外）都按同一套规则解析。
 # ---------------------------------------------------------------------------
 
 def _length_mismatch(where: str, what: str) -> ReviewError:
@@ -278,13 +208,16 @@ def _decode_utf8_param(value: bytes, where: str) -> str:
 
 
 def _parse_svcb_wire(
-    frame: bytes, start: int, end: int, origin: str, where: str
+    cursor: WireCursor, start: int, end: int, origin: str, where: str
 ) -> str:
     """解析 SVCB/HTTPS 的 wire RDATA，返回与区域文本一致的规范形式。"""
+    frame = cursor.buf
     if end - start < 3:  # 2 字节优先级 + 至少 1 字节根名
         raise _length_mismatch(where, "SVCB/HTTPS RDATA 过短，")
     (priority,) = struct.unpack("!H", frame[start : start + 2])
-    target, pos = _read_name(frame, start + 2, where)
+    target_name_obj = cursor.name(start + 2, where)
+    target_name = target_name_obj.name
+    pos = target_name_obj.next_offset
     tokens: list[str] = []
     while pos < end:
         if pos + 4 > end:
@@ -295,7 +228,7 @@ def _parse_svcb_wire(
             raise _length_mismatch(where, "SvcParam 值超出 RDATA 末尾，")
         tokens.append(_svcb_param_text(key_num, frame[pos : pos + vlen], where))
         pos += vlen
-    text = " ".join([str(priority), target] + tokens)
+    text = " ".join([str(priority), target_name] + tokens)
     try:
         return parse_svcb_rdata(text, origin).canonical
     except ZoneParseError as exc:
@@ -305,14 +238,15 @@ def _parse_svcb_wire(
 
 
 def _parse_rdata(
-    frame: bytes, rtype: str, start: int, rdlength: int, origin: str,
-    where: str,
+    cursor: WireCursor, rtype: str, start: int, rdlength: int,
+    origin: str, where: str,
 ):
     """把一条 wire RDATA 解析为规范文本（SOA 为 7 字段元组）。
 
-    名称可压缩（指针可指向 RDATA 之外的报文任意位置），但名称/字段
-    在 RDATA 区间内消费的字节数必须与 RDLENGTH 完全一致。
+    名称经共享游标解压（指针可指向 RDATA 之外的报文任意位置），但
+    名称/字段在 RDATA 区间内消费的字节数必须与 RDLENGTH 完全一致。
     """
+    frame = cursor.buf
     end = start + rdlength
     if rtype == "A":
         if rdlength != 4:
@@ -327,15 +261,17 @@ def _parse_rdata(
     if rtype in ("NS", "CNAME"):
         if rdlength < 1:
             raise _length_mismatch(where, f"{rtype} RDATA 为空，")
-        name, pos = _read_name(frame, start, where)
-        if pos != end:
+        parsed = cursor.name(start, where)
+        if parsed.next_offset != end:
             raise _length_mismatch(where, "名称未恰好占满 RDATA，")
-        return name
+        return parsed.name
     if rtype == "SOA":
         if rdlength < 22:  # 两个根名 + 5 个 uint32
             raise _length_mismatch(where, "SOA RDATA 过短，")
-        mname, pos = _read_name(frame, start, where)
-        rname, pos = _read_name(frame, pos, where)
+        mname_obj = cursor.name(start, where)
+        mname = mname_obj.name
+        rname_obj = cursor.name(mname_obj.next_offset, where)
+        rname, pos = rname_obj.name, rname_obj.next_offset
         if pos + 20 != end:
             raise _length_mismatch(where, "名称与定时器未恰好占满 RDATA，")
         timers = struct.unpack("!IIIII", frame[pos : pos + 20])
@@ -344,8 +280,9 @@ def _parse_rdata(
         if rdlength < 3:  # 2 字节优先级 + 至少 1 字节根名
             raise _length_mismatch(where, "MX RDATA 过短，")
         (preference,) = struct.unpack("!H", frame[start : start + 2])
-        exchange, pos = _read_name(frame, start + 2, where)
-        if pos != end:
+        parsed = cursor.name(start + 2, where)
+        exchange = parsed.name
+        if parsed.next_offset != end:
             raise _length_mismatch(where, "交换主机名未恰好占满 RDATA，")
         return f"{preference} {exchange}"
     if rtype == "TXT":
@@ -366,7 +303,7 @@ def _parse_rdata(
             )
         return " ".join(quote_character_string(item) for item in strings)
     if rtype in ("SVCB", "HTTPS"):
-        return _parse_svcb_wire(frame, start, end, origin, where)
+        return _parse_svcb_wire(cursor, start, end, origin, where)
     if rtype == "CAA":
         if rdlength < 2:
             raise _length_mismatch(where, "CAA RDATA 过短，")
@@ -445,69 +382,50 @@ def _split_frames(data: bytes) -> list[bytes]:
 
 
 def _parse_frame(frame: bytes, index: int, origin: str) -> AxfrFrame:
-    """解析一帧的 DNS 头、问题区与回答区（授权区/附加区忽略）。"""
-    where = f"第 {index} 帧"
-    if len(frame) < 12:
-        raise ReviewError(
-            "frame_truncated",
-            f"{where}：DNS 头不足 12 字节（实际 {len(frame)} 字节）",
-            422,
-        )
-    (message_id, flags, qdcount, ancount, _nscount, _arcount) = struct.unpack(
-        "!HHHHHH", frame[:12]
-    )
-    qr = bool(flags & 0x8000)
-    opcode = (flags >> 11) & 0xF
-    tc = bool(flags & 0x0200)
-    rcode = flags & 0xF
+    """解析一帧的 DNS 头、问题区与回答区（授权区/附加区忽略）。
 
-    pos = 12
+    通过 :class:`app.wire.WireCursor` 共享游标顺序消费：头 → 问题区 →
+    回答区；检查顺序与错误优先级保持原有行为（每条回答先判定类型支持，
+    再查 TTL 与 RDATA 边界，最后解释 RDATA）。
+    """
+    where = f"第 {index} 帧"
+    head = parse_header(frame, "frame_truncated", f"{where}：")
+    message_id, flags = head.message_id, head.flags
+    qdcount, ancount = head.qdcount, head.ancount
+    qr, opcode, tc, rcode = head.qr, head.opcode, head.tc, head.rcode
+
+    cursor = WireCursor(frame, truncated_code="frame_truncated")
+
     questions = []
     for _ in range(qdcount):
-        qname, pos = _read_name(frame, pos, f"{where} 问题区")
-        if pos + 4 > len(frame):
-            raise ReviewError(
-                "frame_truncated", f"{where}：问题区 QTYPE/QCLASS 截断", 422
-            )
-        qtype, qclass = struct.unpack("!HH", frame[pos : pos + 4])
-        pos += 4
-        questions.append((qname, qtype, qclass))
+        question = cursor.read_question(
+            f"{where} 问题区", f"{where}：问题区 QTYPE/QCLASS 截断"
+        )
+        questions.append((question.qname, question.qtype, question.qclass))
 
     answers = []
     for rec_no in range(1, ancount + 1):
-        owner, pos = _read_name(frame, pos, f"{where} 回答区")
-        if pos + 10 > len(frame):
-            raise ReviewError(
-                "frame_truncated", f"{where}：第 {rec_no} 条回答的记录头截断",
-                422,
-            )
-        rtype_code, rclass, ttl, rdlength = struct.unpack(
-            "!HHIH", frame[pos : pos + 10]
+        owner_where = f"{where} 回答区"
+        rr = cursor.open_rr(
+            owner_where,
+            f"{where}：第 {rec_no} 条回答的记录头截断",
         )
-        pos += 10
-        rtype = TYPE_NAMES.get(rtype_code)
+        rtype = TYPE_NAMES.get(rr.rtype)
         if rtype is None or rtype == "AXFR":
             raise ReviewError(
                 "unsupported_type",
-                f"{where}：第 {rec_no} 条回答的类型号 {rtype_code} 不受支持",
+                f"{where}：第 {rec_no} 条回答的类型号 {rr.rtype} 不受支持",
                 422,
             )
-        rec_where = f"{where} 第 {rec_no} 条回答（{owner} {rtype}）"
-        if ttl > MAX_TTL:
-            raise ReviewError(
-                "invalid_record",
-                f"{rec_where}：TTL {ttl} 超出 31 位范围",
-                422,
-            )
-        if pos + rdlength > len(frame):
-            raise ReviewError(
-                "frame_truncated", f"{rec_where}：RDATA 超出报文末尾", 422
-            )
-        rdata = _parse_rdata(frame, rtype, pos, rdlength, origin, rec_where)
-        pos += rdlength
+        rec_where = f"{where} 第 {rec_no} 条回答（{rr.owner} {rtype}）"
+        cursor.check_ttl(rr, rec_where)
+        cursor.require_rdata(rr, rec_where)
+        rdata = _parse_rdata(
+            cursor, rtype, rr.rdata_start, rr.rdlength, origin, rec_where
+        )
         answers.append(
-            AxfrRecord(owner=owner, rtype=rtype, rclass=rclass, ttl=ttl,
-                       rdata=rdata)
+            AxfrRecord(owner=rr.owner, rtype=rtype, rclass=rr.rclass,
+                       ttl=rr.ttl, rdata=rdata)
         )
 
     return AxfrFrame(

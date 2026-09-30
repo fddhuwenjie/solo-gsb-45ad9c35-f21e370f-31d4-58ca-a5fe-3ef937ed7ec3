@@ -362,6 +362,38 @@ class TsigUnitTests(unittest.TestCase):
         loop.extend(struct.pack("!HHIH", 250, 255, 0, 0))
         expect422(self, bytes(loop), "compression_pointer_loop")
 
+    def test_nested_pointer_loop_in_owner(self):
+        # owner：前缀标签 + 指针，指针目标又是指回 owner 指针自身的指针
+        q = query()
+        owner_off = len(q)
+        aux_off = owner_off + 2 + 10  # owner 指针后为 RR 固定头；借放 aux
+        # 直接构造：owner = ptr(aux_off)；aux = ptr(owner_off)
+        # aux 放在 RDATA 起点（rdlength 预留），整体结构：
+        rr_head = struct.pack("!HHIH", 250, 255, 0, 2)
+        aux = struct.pack("!H", 0xC000 | owner_off)
+        msg = (
+            q
+            + struct.pack("!H", 0xC000 | (owner_off + 2 + 10))
+            + rr_head + aux
+        )
+        expect422(self, msg, "compression_pointer_loop")
+
+    def test_pointer_out_of_bounds_in_algorithm_name(self):
+        # 结构合法的 TSIG，但算法名指向报文外 -> 越界
+        signed, _ = sign(query())
+        idx = signed.find(struct.pack("!H", 250))
+        rdata_start = idx + 10
+        rebuilt = bytearray(signed)
+        rebuilt[rdata_start:rdata_start + 2] = struct.pack("!H", 0xC0FF)
+        expect422(self, bytes(rebuilt),
+                  "compression_pointer_out_of_bounds")
+
+    def test_half_pointer_in_owner_is_truncated(self):
+        # owner 压缩指针只有半个字节：frame/message 截断码为 message_truncated
+        q = query()
+        msg = q + b"\xc0"
+        expect422(self, msg, "message_truncated")
+
     def test_compressed_owner_and_algorithm_are_parsed(self):
         # owner 用帧内合法压缩指针指向问题区里的 example.com.
         signed, _ = sign(query(), key_name="tsigkey.example.com.")
@@ -377,6 +409,55 @@ class TsigUnitTests(unittest.TestCase):
         ))
         self.assertEqual(result["status"], "authenticated")
         self.assertEqual(result["key_name"], "tsigkey.example.com.")
+
+    def test_nested_pointer_in_owner_still_authenticates(self):
+        """TSIG owner 使用两级嵌套压缩指针仍须通过。
+
+        解压只用于规范变量（小写不压缩 wire），HMAC 的“已签名报文”
+        必须按**原字节边界**截断到 TSIG RR 起点——即使 owner 是多级
+        压缩指针，验签也应通过。
+
+        布局（问题区 www.example.com.，example.com. 位于偏移 16）：
+        TSIG RDATA Other 放 6 字节 aux = ``\\x03key + ptr(16)``
+        （= key.example.com.），TSIG owner = ``\\x08tsigkey2 +
+        ptr(other_off)``（两级嵌套 -> tsigkey2.key.example.com.）。
+        """
+        key_name = "tsigkey2.key.example.com."
+        q = query()
+        aux = b"\x03key" + struct.pack("!H", 0xC000 | 16)  # 6 字节
+        other = aux
+
+        hash_name = "sha256"
+        pre = bytearray(q)
+        struct.pack_into("!H", pre, 10, 0)  # 已签名报文 ARCOUNT=0
+        variables = _variables(key_name, "hmac-sha256.", WHEN, FUDGE,
+                               error=0, other=other)
+        mac = hmac.new(SECRET, bytes(pre) + variables, hash_name).digest()
+
+        rdata = (
+            wname("hmac-sha256.")
+            + WHEN.to_bytes(6, "big")
+            + struct.pack("!H", FUDGE)
+            + struct.pack("!H", len(mac)) + mac
+            + struct.pack("!HHH", MID, 0, len(other))
+            + other
+        )
+        other_off = len(q)  # 先占位计算，稍后修正
+        owner = b"\x08tsigkey2" + b"\x00\x00"  # 指针稍后回填
+        rr_fixed = struct.pack("!HHIH", 250, 255, 0, len(rdata))
+        other_off = len(q) + len(owner) + len(rr_fixed) + len(rdata) - len(other)
+        owner = b"\x08tsigkey2" + struct.pack("!H", 0xC000 | other_off)
+        tsig_rr = owner + rr_fixed + rdata
+
+        signed_msg = bytearray(q)
+        struct.pack_into("!H", signed_msg, 10, 1)
+        signed = bytes(signed_msg) + tsig_rr
+
+        result = verify_tsig(payload(signed, key_name=key_name))
+        self.assertEqual(result["status"], "authenticated", result)
+        self.assertEqual(result["key_name"], key_name)
+        self.assertEqual(result["other_len"], 6)
+        self.assertEqual(result["mac_size"], 32)
 
     # ---- 请求格式：400 ----
 

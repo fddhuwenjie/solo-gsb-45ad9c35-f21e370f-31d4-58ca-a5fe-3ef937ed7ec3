@@ -51,6 +51,7 @@ import hmac
 import struct
 
 from .review import ReviewError
+from .wire import WireCursor, parse_header
 from .zoneparse import ZoneParseError, validate_name
 
 TYPE_TSIG = 250
@@ -64,74 +65,11 @@ ALGORITHMS = {
 
 
 # ---------------------------------------------------------------------------
-# 名称读取（RFC 1035 §4.1.4，与 app.axfr 同一套压缩规则）
+# 名称规范化（wire 编码）
+#
+# 名称解压（RFC 1035 §4.1.4，与 app.axfr 共用同一套压缩/成环/越界
+# 规则）统一由 app.wire 共享层提供；这里只保留规范 wire 编码。
 # ---------------------------------------------------------------------------
-
-def _read_name(message: bytes, offset: int, where: str) -> tuple[str, int]:
-    """在 ``offset`` 处读取一个（可压缩的）域名，返回 (小写绝对名, 下一偏移)。"""
-    labels: list[str] = []
-    pos = offset
-    end: int | None = None
-    visited: set[int] = set()
-    while True:
-        if pos >= len(message):
-            raise ReviewError(
-                "message_truncated", f"{where}：名称超出报文末尾", 422
-            )
-        length = message[pos]
-        if length & 0xC0 == 0xC0:
-            if pos + 1 >= len(message):
-                raise ReviewError(
-                    "message_truncated", f"{where}：压缩指针只有半个字节", 422
-                )
-            target = ((length & 0x3F) << 8) | message[pos + 1]
-            if target >= len(message):
-                raise ReviewError(
-                    "compression_pointer_out_of_bounds",
-                    f"{where}：压缩指针指向报文外偏移 {target}",
-                    422,
-                )
-            if end is None:
-                end = pos + 2
-            if target in visited:
-                raise ReviewError(
-                    "compression_pointer_loop",
-                    f"{where}：压缩指针在偏移 {target} 处成环",
-                    422,
-                )
-            visited.add(target)
-            pos = target
-            continue
-        if length & 0xC0:
-            raise ReviewError(
-                "invalid_name", f"{where}：非法标签类型字节 0x{length:02x}",
-                422,
-            )
-        pos += 1
-        if length == 0:
-            break
-        if pos + length > len(message):
-            raise ReviewError(
-                "message_truncated", f"{where}：标签超出报文末尾", 422
-            )
-        raw = message[pos : pos + length]
-        try:
-            labels.append(raw.decode("ascii").lower())
-        except UnicodeDecodeError as exc:
-            raise ReviewError(
-                "invalid_name", f"{where}：名称标签含非 ASCII 字节: {exc}",
-                422,
-            ) from exc
-        pos += length
-    name = (".".join(labels) + ".") if labels else "."
-    try:
-        validate_name(name)
-    except ZoneParseError as exc:
-        raise ReviewError(
-            "invalid_name", f"{where}：名称非法: {exc}", 422
-        ) from exc
-    return name, (end if end is not None else pos)
-
 
 def _wire_name(name: str) -> bytes:
     """小写绝对名 -> 规范 wire（不压缩；RFC 4034 §6.1 的名称编码）。"""
@@ -148,41 +86,23 @@ def _wire_name(name: str) -> bytes:
 
 # ---------------------------------------------------------------------------
 # 报文结构解析
+#
+# 名称解压、问题区与 RR 游标统一使用 app.wire 共享层。游标给出的
+# RRView 携带原始 RR 边界（start/rdata_start/rdata_end），TSIG 位于
+# 附加区末尾，其 ``start`` 即“已签名报文”在**原报文字节**中的截断点
+# （见 _signed_message）——HMAC 输入必须使用该原始边界，绝不基于解压
+# 后重建的字节。
 # ---------------------------------------------------------------------------
 
-def _skip_rr(message: bytes, pos: int, where: str) -> tuple[int, int, int, int,
-                                                            int, str, int]:
-    """跳过一条资源记录。
-
-    返回 ``(下一偏移, type, class, ttl, rdlength, owner, rdata 起始偏移)``。
-    """
-    owner, pos = _read_name(message, pos, where)
-    if pos + 10 > len(message):
-        raise ReviewError(
-            "message_truncated", f"{where}：记录头截断", 422
-        )
-    rtype, rclass, ttl, rdlength = struct.unpack("!HHIH", message[pos : pos + 10])
-    rdata_start = pos + 10
-    pos += 10
-    if ttl > 2**31 - 1:
-        raise ReviewError(
-            "invalid_record", f"{where}：TTL {ttl} 超出 31 位范围", 422
-        )
-    if pos + rdlength > len(message):
-        raise ReviewError(
-            "message_truncated", f"{where}：RDATA 超出报文末尾", 422
-        )
-    return (
-        pos + rdlength, rtype, rclass, ttl, rdlength, owner, rdata_start
-    )
-
-
 def _parse_tsig_rdata(
-    message: bytes, start: int, rdlength: int, where: str
+    cursor: WireCursor, start: int, rdlength: int, where: str
 ) -> dict:
     """解析 TSIG RDATA（RFC 8945 §3），任一字段截断均为 422。"""
+    message = cursor.buf
     end = start + rdlength
-    algorithm, pos = _read_name(message, start, f"{where} 算法名")
+    alg_obj = cursor.name(start, f"{where} 算法名")
+    algorithm = alg_obj.name
+    pos = alg_obj.next_offset
     # time signed(6) + fudge(2) + mac size(2) 共 10 字节
     if pos + 10 > end:
         raise ReviewError(
@@ -228,60 +148,52 @@ def _parse_tsig_rdata(
 
 
 def _parse_message(message: bytes) -> dict:
-    """解析 DNS 头与四个区，定位唯一且位于附加区末尾的 TSIG。"""
-    if len(message) < 12:
-        raise ReviewError(
-            "message_truncated",
-            f"DNS 头不足 12 字节（实际 {len(message)} 字节）",
-            422,
-        )
-    message_id, _flags, qdcount, ancount, nscount, arcount = struct.unpack(
-        "!HHHHHH", message[:12]
-    )
+    """解析 DNS 头与四个区，定位唯一且位于附加区末尾的 TSIG。
 
-    pos = 12
-    for i in range(1, qdcount + 1):
-        _qname, pos = _read_name(message, pos, f"问题区第 {i} 项名称")
-        if pos + 4 > len(message):
-            raise ReviewError(
-                "message_truncated", f"问题区第 {i} 项 QTYPE/QCLASS 截断", 422
-            )
-        pos += 4
+    各区按 RFC 顺序（问题 → 回答 → 授权 → 附加）经共享游标扫描；扫描
+    结束后游标必须恰好在报文末尾，否则为尾随字节错误。
+    """
+    head = parse_header(message, "message_truncated", "")
+    message_id, arcount = head.message_id, head.arcount
+    cursor = WireCursor(message, truncated_code="message_truncated")
+
+    for i in range(1, head.qdcount + 1):
+        cursor.read_question(
+            f"问题区第 {i} 项名称",
+            f"问题区第 {i} 项 QTYPE/QCLASS 截断",
+        )
 
     tsig_hits: list[dict] = []
 
     def scan(count: int, section: str) -> None:
-        nonlocal pos
         for i in range(1, count + 1):
-            rr_start = pos
             where = f"{section}第 {i} 条记录"
-            after, rtype, rclass, ttl, rdlength, owner, rdata_start = _skip_rr(
-                message, pos, where
-            )
-            if rtype == TYPE_TSIG:
+            rr = cursor.open_rr(where, f"{where}：记录头截断")
+            cursor.check_ttl(rr, where)
+            cursor.require_rdata(rr, where)
+            if rr.rtype == TYPE_TSIG:
                 tsig_hits.append(
                     {
                         "section": section,
                         "index": i,
                         "count": count,
-                        "start": rr_start,
-                        "rdata_start": rdata_start,
-                        "rclass": rclass,
-                        "ttl": ttl,
-                        "rdlength": rdlength,
-                        "owner": owner,
+                        "start": rr.start,
+                        "rdata_start": rr.rdata_start,
+                        "rclass": rr.rclass,
+                        "ttl": rr.ttl,
+                        "rdlength": rr.rdlength,
+                        "owner": rr.owner,
                     }
                 )
-            pos = after
 
-    scan(ancount, "回答区")
-    scan(nscount, "授权区")
+    scan(head.ancount, "回答区")
+    scan(head.nscount, "授权区")
     scan(arcount, "附加区")
 
-    if pos != len(message):
+    if not cursor.at_end():
         raise ReviewError(
             "message_trailing_bytes",
-            f"各区解析后仍有 {len(message) - pos} 个尾随字节",
+            f"各区解析后仍有 {cursor.trailing_count()} 个尾随字节",
             422,
         )
 
@@ -319,7 +231,7 @@ def _parse_message(message: bytes) -> dict:
         )
 
     rdata = _parse_tsig_rdata(
-        message,
+        cursor,
         hit["rdata_start"],
         hit["rdlength"],
         "TSIG",

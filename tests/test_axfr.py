@@ -198,6 +198,66 @@ class CompleteTransferTests(unittest.TestCase):
         self.assertEqual(result["status"], "complete", result)
         self.assertEqual(result["zone"], EXPECTED_ZONE)
 
+    def test_nested_pointers_in_owner_and_rdata(self):
+        """两级嵌套压缩指针：指针指向另一条记录 RDATA 内的标签。
+
+        帧 2 布局（帧内偏移动态计算）：
+          A   owner=ns1.example.com.（全名），RDATA 192.0.2.10；
+          TXT owner=\\x03www + 指针(A owner 起点) -> www.example.com.，
+              RDATA 的 character-string 内嵌 ``\\x03sub + 同名指针``
+              （= sub.example.com.，仅作为被引用的字节）；
+          NS  owner=指针(TXT owner 起点)（一级 -> www.example.com.），
+              RDATA=\\x04host + 指针(TXT RDATA 内 sub 标签起点)
+              （两级嵌套 -> host.sub.example.com.）；
+          闭合 SOA（全名）。
+        """
+        frame1, _ = good_frames()
+
+        frame_offset = len(header(MID, 0, 4))  # 帧体中记录区起点（=12）
+        a1 = record(name_wire("ns1.example.com."), T_A, 300,
+                    bytes([192, 0, 2, 10]))
+        a_owner_off = frame_offset
+        txt_owner_off = frame_offset + len(a1)
+
+        txt_owner = b"\x03www" + ptr(a_owner_off)
+        # character-string 内嵌一个完整的 example.com. wire 名（偏移
+        # suffix_off），供后续 NS 的两级嵌套指针引用
+        suffix_name = name_wire("example.com.")
+        embedded_name = b"\x03sub" + ptr(a_owner_off)  # sub.ns1.example.com.
+        txt_rdata = (
+            bytes([len(embedded_name)]) + embedded_name
+            + bytes([len(suffix_name)]) + suffix_name
+        )
+        txt_rec = record(txt_owner, T_TXT, 300, txt_rdata)
+        # 第二段 character-string（example.com. 全名）的帧内偏移：
+        # 记录起点 + owner(6) + 固定头(10) + 第一段 [长度1 + 内容8]
+        suffix_off = txt_owner_off + len(txt_owner) + 10 + 1 + 1 + len(
+            embedded_name
+        )
+
+        ns_owner_off = txt_owner_off + len(txt_rec)
+        ns_rdata = b"\x04host\x03sub" + ptr(suffix_off)
+        ns_rec = record(ptr(txt_owner_off), T_NS, 300, ns_rdata)
+
+        closing = record(name_wire("example.com."), T_SOA, 300,
+                         soa_rdata(name_wire("ns1.example.com."),
+                                   name_wire("admin.example.com.")))
+        frame2 = header(MID, 0, 4) + a1 + txt_rec + ns_rec + closing
+        result = inspect([frame1, frame2])
+        self.assertEqual(result["status"], "complete", result)
+        trace2 = result["trace"][1]["answers"]
+        self.assertEqual(trace2[0]["owner"], "ns1.example.com.")
+        # TXT owner 经一级指针还原（指针目标是 ns1.example.com.）
+        self.assertEqual(trace2[1]["owner"], "www.ns1.example.com.")
+        self.assertEqual(trace2[1]["type"], "TXT")
+        # NS owner 一级指针；RDATA 名称两级标签后再跟随指针
+        self.assertEqual(trace2[2]["owner"], "www.ns1.example.com.")
+        self.assertEqual(trace2[2]["type"], "NS")
+        self.assertEqual(trace2[2]["rdata"], "host.sub.example.com.")
+        # 规范区域文本包含被嵌套指针还原出的委托名
+        self.assertIn("www.ns1.example.com. 300 IN NS host.sub.example.com.",
+                      result["zone"])
+
     def test_all_supported_types_round_trip(self):
         apex = ptr(12)
         soa = record(apex, T_SOA, 300,
@@ -460,6 +520,44 @@ class ParseErrorTests(unittest.TestCase):
         )
         exc = error_of([frame])
         self.assertEqual(exc.code, "compression_pointer_loop")
+
+    def test_pointer_loop_inside_rdata(self):
+        # SOA 的 mname 内部两级指针成环（问题区合法，错误定位在回答）
+        apex = ptr(12)
+        soa_owner = apex
+        # 手工拼 SOA：mname = ptr(X)，X 处放 ptr(回 mname)
+        q = question()
+        mname_ptr_off = 12 + len(q) + len(soa_owner) + 10  # RDATA 起点
+        target = mname_ptr_off + 2
+        mname = ptr(target)
+        loop_back = ptr(mname_ptr_off)
+        rdata = mname + loop_back + b"\x00" * 24
+        soa = record(soa_owner, T_SOA, 300, rdata)
+        frame = header(MID, 1, 1) + q + soa
+        exc = error_of([frame])
+        self.assertEqual(exc.code, "compression_pointer_loop")
+        self.assertIn("第 1 帧 第 1 条回答", exc.message)
+
+    def test_pointer_out_of_bounds_inside_rdata(self):
+        apex = ptr(12)
+        soa = record(apex, T_SOA, 300,
+                     soa_rdata(b"\x03ns1" + ptr(12), b"\x05admin" + ptr(12)))
+        # NS RDATA 名称直接指向报文外
+        bad_ns = record(apex, T_NS, 300, ptr(0x3FFF))
+        frame = header(MID, 1, 2) + question() + soa + bad_ns
+        exc = error_of([frame])
+        self.assertEqual(exc.code, "compression_pointer_out_of_bounds")
+        self.assertIn("回答", exc.message)
+
+    def test_compressed_name_with_trailing_rdata_byte(self):
+        # NS RDATA：压缩指针（2 字节）后多一个字节 -> 长度不符
+        apex = ptr(12)
+        soa = record(apex, T_SOA, 300,
+                     soa_rdata(b"\x03ns1" + ptr(12), b"\x05admin" + ptr(12)))
+        bad_ns = record(apex, T_NS, 300, ptr(12) + b"\x41")
+        frame = header(MID, 1, 2) + question() + soa + bad_ns
+        exc = error_of([frame])
+        self.assertEqual(exc.code, "rdata_length_mismatch")
 
     def test_compression_pointer_out_of_bounds(self):
         frame = header(MID, 1, 0) + ptr(0x3FFF) + struct.pack("!HH", 252, 1)
