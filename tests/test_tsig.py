@@ -378,6 +378,54 @@ class TsigUnitTests(unittest.TestCase):
         self.assertEqual(result["status"], "authenticated")
         self.assertEqual(result["key_name"], "tsigkey.example.com.")
 
+    def test_nested_compression_pointer_in_owner(self):
+        # owner 用两跳指针：指向 TSIG Other 内的转发点，转发点再指向
+        # 问题区里的 example.com. 全名（偏移 16）。转发点位于已签名
+        # 报文截断点（TSIG owner 起始）之后，故不动 HMAC 第 2 项；
+        # Other 属于第 3 项变量，按 RFC 8945 §5.2 独立重算并回填 MAC
+        # （MAC 字段本身不属于 HMAC 输入）。
+        key = "tsigkey.example.com."
+        other = struct.pack("!H", 0xC000 | 16) + b"\x00" * 5  # 转发点@Other 起始
+        pre = bytearray(query())
+        struct.pack_into("!H", pre, 10, 0)  # ARCOUNT 减一（已签名报文）
+        data = bytes(pre) + _variables(
+            key, "hmac-sha256.", WHEN, FUDGE, 0, other
+        )
+        mac = hmac.new(SECRET, data, "sha256").digest()
+
+        owner_wire = b"\x07tsigkey" + struct.pack("!H", 0)  # 目标稍后回填
+        rdata = (
+            wname("hmac-sha256.")
+            + WHEN.to_bytes(6, "big")
+            + struct.pack("!H", FUDGE)
+            + struct.pack("!H", len(mac)) + mac
+            + struct.pack("!HHH", MID, 0, len(other))
+            + other
+        )
+        msg = bytearray(query())
+        owner_off = len(msg)
+        msg += owner_wire + struct.pack("!HHIH", 250, 255, 0, len(rdata))
+        msg += rdata
+        forward_target = owner_off + len(owner_wire) + 10 + (
+            len(rdata) - len(other)
+        )
+        struct.pack_into("!H", msg, owner_off + 8, 0xC000 | forward_target)
+
+        result = verify_tsig(payload(bytes(msg), key_name=key))
+        self.assertEqual(result["status"], "authenticated", result)
+        self.assertEqual(result["key_name"], key)
+        self.assertEqual(result["other_len"], 7)
+
+    def test_compression_pointer_chain_loop_in_additional(self):
+        # 附加区 TSIG owner：ptr(owner+2) -> ptr(owner) -> 成环
+        q = query()
+        owner_off = len(q)
+        loop = bytearray(q)
+        loop.extend(struct.pack("!H", 0xC000 | owner_off + 2))
+        loop.extend(struct.pack("!H", 0xC000 | owner_off))
+        loop.extend(struct.pack("!HHIH", 250, 255, 0, 0))
+        expect422(self, bytes(loop), "compression_pointer_loop")
+
     # ---- 请求格式：400 ----
 
     def test_invalid_request_shapes(self):

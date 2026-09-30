@@ -51,6 +51,7 @@ import hmac
 import struct
 
 from .review import ReviewError
+from .wire import MAX_TTL, RawRR, WireReader
 from .zoneparse import ZoneParseError, validate_name
 
 TYPE_TSIG = 250
@@ -61,76 +62,6 @@ ALGORITHMS = {
     "hmac-sha256.": ("sha256", hashlib.sha256().digest_size),
     "hmac-sha512.": ("sha512", hashlib.sha512().digest_size),
 }
-
-
-# ---------------------------------------------------------------------------
-# 名称读取（RFC 1035 §4.1.4，与 app.axfr 同一套压缩规则）
-# ---------------------------------------------------------------------------
-
-def _read_name(message: bytes, offset: int, where: str) -> tuple[str, int]:
-    """在 ``offset`` 处读取一个（可压缩的）域名，返回 (小写绝对名, 下一偏移)。"""
-    labels: list[str] = []
-    pos = offset
-    end: int | None = None
-    visited: set[int] = set()
-    while True:
-        if pos >= len(message):
-            raise ReviewError(
-                "message_truncated", f"{where}：名称超出报文末尾", 422
-            )
-        length = message[pos]
-        if length & 0xC0 == 0xC0:
-            if pos + 1 >= len(message):
-                raise ReviewError(
-                    "message_truncated", f"{where}：压缩指针只有半个字节", 422
-                )
-            target = ((length & 0x3F) << 8) | message[pos + 1]
-            if target >= len(message):
-                raise ReviewError(
-                    "compression_pointer_out_of_bounds",
-                    f"{where}：压缩指针指向报文外偏移 {target}",
-                    422,
-                )
-            if end is None:
-                end = pos + 2
-            if target in visited:
-                raise ReviewError(
-                    "compression_pointer_loop",
-                    f"{where}：压缩指针在偏移 {target} 处成环",
-                    422,
-                )
-            visited.add(target)
-            pos = target
-            continue
-        if length & 0xC0:
-            raise ReviewError(
-                "invalid_name", f"{where}：非法标签类型字节 0x{length:02x}",
-                422,
-            )
-        pos += 1
-        if length == 0:
-            break
-        if pos + length > len(message):
-            raise ReviewError(
-                "message_truncated", f"{where}：标签超出报文末尾", 422
-            )
-        raw = message[pos : pos + length]
-        try:
-            labels.append(raw.decode("ascii").lower())
-        except UnicodeDecodeError as exc:
-            raise ReviewError(
-                "invalid_name", f"{where}：名称标签含非 ASCII 字节: {exc}",
-                422,
-            ) from exc
-        pos += length
-    name = (".".join(labels) + ".") if labels else "."
-    try:
-        validate_name(name)
-    except ZoneParseError as exc:
-        raise ReviewError(
-            "invalid_name", f"{where}：名称非法: {exc}", 422
-        ) from exc
-    return name, (end if end is not None else pos)
 
 
 def _wire_name(name: str) -> bytes:
@@ -150,39 +81,13 @@ def _wire_name(name: str) -> bytes:
 # 报文结构解析
 # ---------------------------------------------------------------------------
 
-def _skip_rr(message: bytes, pos: int, where: str) -> tuple[int, int, int, int,
-                                                            int, str, int]:
-    """跳过一条资源记录。
-
-    返回 ``(下一偏移, type, class, ttl, rdlength, owner, rdata 起始偏移)``。
-    """
-    owner, pos = _read_name(message, pos, where)
-    if pos + 10 > len(message):
-        raise ReviewError(
-            "message_truncated", f"{where}：记录头截断", 422
-        )
-    rtype, rclass, ttl, rdlength = struct.unpack("!HHIH", message[pos : pos + 10])
-    rdata_start = pos + 10
-    pos += 10
-    if ttl > 2**31 - 1:
-        raise ReviewError(
-            "invalid_record", f"{where}：TTL {ttl} 超出 31 位范围", 422
-        )
-    if pos + rdlength > len(message):
-        raise ReviewError(
-            "message_truncated", f"{where}：RDATA 超出报文末尾", 422
-        )
-    return (
-        pos + rdlength, rtype, rclass, ttl, rdlength, owner, rdata_start
-    )
-
-
 def _parse_tsig_rdata(
-    message: bytes, start: int, rdlength: int, where: str
+    reader: WireReader, start: int, rdlength: int, where: str
 ) -> dict:
     """解析 TSIG RDATA（RFC 8945 §3），任一字段截断均为 422。"""
+    message = reader.data
     end = start + rdlength
-    algorithm, pos = _read_name(message, start, f"{where} 算法名")
+    algorithm, pos = reader.read_name(start, f"{where} 算法名")
     # time signed(6) + fudge(2) + mac size(2) 共 10 字节
     if pos + 10 > end:
         raise ReviewError(
@@ -228,62 +133,60 @@ def _parse_tsig_rdata(
 
 
 def _parse_message(message: bytes) -> dict:
-    """解析 DNS 头与四个区，定位唯一且位于附加区末尾的 TSIG。"""
-    if len(message) < 12:
-        raise ReviewError(
-            "message_truncated",
-            f"DNS 头不足 12 字节（实际 {len(message)} 字节）",
-            422,
-        )
-    message_id, _flags, qdcount, ancount, nscount, arcount = struct.unpack(
-        "!HHHHHH", message[:12]
-    )
+    """解析 DNS 头与四个区，定位唯一且位于附加区末尾的 TSIG。
 
-    pos = 12
-    for i in range(1, qdcount + 1):
-        _qname, pos = _read_name(message, pos, f"问题区第 {i} 项名称")
-        if pos + 4 > len(message):
-            raise ReviewError(
-                "message_truncated", f"问题区第 {i} 项 QTYPE/QCLASS 截断", 422
-            )
-        pos += 4
+    区的遍历顺序固定为 问题区 -> 回答区 -> 授权区 -> 附加区；每条 RR
+    经共享 RR 游标切出原始边界后，仍按原顺序核对 TTL 与 RDATA 边界。
+    """
+    reader, head = WireReader.open(
+        message,
+        "message_truncated",
+        "DNS 头不足 12 字节",
+    )
+    message_id = head["id"]
+
+    for i in range(1, head["qdcount"] + 1):
+        reader.read_question(
+            f"问题区第 {i} 项名称",
+            f"问题区第 {i} 项 QTYPE/QCLASS 截断",
+        )
 
     tsig_hits: list[dict] = []
 
     def scan(count: int, section: str) -> None:
-        nonlocal pos
         for i in range(1, count + 1):
-            rr_start = pos
             where = f"{section}第 {i} 条记录"
-            after, rtype, rclass, ttl, rdlength, owner, rdata_start = _skip_rr(
-                message, pos, where
+            # RR 游标只切原始边界（owner 与 RDATA 均在原报文字节上）；
+            # TTL/RDATA 越界检查仍按原顺序在此完成
+            rr: RawRR = reader.read_rr(where, f"{where}：记录头截断")
+            if rr.ttl > MAX_TTL:
+                raise ReviewError(
+                    "invalid_record", f"{where}：TTL {rr.ttl} 超出 31 位范围",
+                    422,
+                )
+            reader.require_rdata_within(
+                rr, f"{where}：RDATA 超出报文末尾"
             )
-            if rtype == TYPE_TSIG:
+            if rr.rtype == TYPE_TSIG:
                 tsig_hits.append(
                     {
                         "section": section,
                         "index": i,
                         "count": count,
-                        "start": rr_start,
-                        "rdata_start": rdata_start,
-                        "rclass": rclass,
-                        "ttl": ttl,
-                        "rdlength": rdlength,
-                        "owner": owner,
+                        "start": rr.start,
+                        "rdata_start": rr.rdata_start,
+                        "rclass": rr.rclass,
+                        "ttl": rr.ttl,
+                        "rdlength": rr.rdlength,
+                        "owner": rr.owner,
                     }
                 )
-            pos = after
 
-    scan(ancount, "回答区")
-    scan(nscount, "授权区")
-    scan(arcount, "附加区")
+    scan(head["ancount"], "回答区")
+    scan(head["nscount"], "授权区")
+    scan(head["arcount"], "附加区")
 
-    if pos != len(message):
-        raise ReviewError(
-            "message_trailing_bytes",
-            f"各区解析后仍有 {len(message) - pos} 个尾随字节",
-            422,
-        )
+    reader.require_end("message_trailing_bytes", "各区解析后")
 
     if not tsig_hits:
         raise ReviewError("missing_tsig", "报文中不存在 TSIG 记录", 422)
@@ -319,7 +222,7 @@ def _parse_message(message: bytes) -> dict:
         )
 
     rdata = _parse_tsig_rdata(
-        message,
+        reader,
         hit["rdata_start"],
         hit["rdlength"],
         "TSIG",
@@ -334,7 +237,7 @@ def _parse_message(message: bytes) -> dict:
 
     return {
         "message_id": message_id,
-        "arcount": arcount,
+        "arcount": head["arcount"],
         "tsig_start": hit["start"],
         "key_name": hit["owner"],
         "tsig_class": hit["rclass"],

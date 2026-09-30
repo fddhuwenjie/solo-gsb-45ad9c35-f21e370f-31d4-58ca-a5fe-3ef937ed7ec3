@@ -179,6 +179,43 @@ class CompleteTransferTests(unittest.TestCase):
         )
         self.assertTrue(review["safe"])
 
+    def test_nested_compression_pointers_in_owner_and_rdata(self):
+        # 两跳指针（指向另一个指针再指向全名）同时出现在 owner 与
+        # RDATA 内：帧 2 的 A/TXT/CNAME 均引用转发点 39。
+        apex = ptr(12)
+        soa = record(apex, T_SOA, 300,
+                     soa_rdata(b"\x03ns1" + ptr(12), b"\x05admin" + ptr(12)))
+        ns1 = record(apex, T_NS, 300, b"\x03ns1" + ptr(12))
+        frame1 = header(MID, 1, 2) + question() + soa + ns1
+
+        # A @12（body 到 43）；TXT owner ptr(16) 在 43；TXT rdata
+        # 起始于 55，其中转发点 @56 = \192\016（指向偏移 16 的
+        # example.com. 全名）
+        a1 = record(name_wire("ns1.example.com."), T_A, 300,
+                    bytes([192, 0, 2, 10]))
+        # TXT 字符 \192\16\000：第二、三字节恰为指向偏移 16 的压缩
+        # 指针，作为名称转发点 @56 解析时跳到 16 -> example.com.
+        txt = record(ptr(16), T_TXT, 300, bytes([3, 0xC0, 16, 0]))
+        forward = 12 + len(a1) + 2 + 10 + 1  # = 56
+        cname = record(b"\x03www" + ptr(forward), T_CNAME, 300, ptr(forward))
+        closing = record(ptr(forward), T_SOA, 300,
+                         soa_rdata(ptr(12), b"\x05admin" + ptr(16)))
+        frame2 = header(MID, 0, 4) + a1 + txt + cname + closing
+        result = inspect([frame1, frame2])
+        self.assertEqual(result["status"], "complete", result)
+        self.assertEqual(result["record_count"], 6)
+        zone = parse_zone(result["zone"])
+        self.assertEqual(zone.get("www.example.com.", "CNAME").rdata,
+                         ("example.com.",))
+        self.assertEqual(zone.get(ORIGIN, "TXT").rdata,
+                         ('"\\192\\016\\000"',))
+        # 轨迹内容与区文本未因共享层改造而变化
+        self.assertEqual(
+            result["trace"][1]["answers"][2],
+            {"seq": 5, "owner": "www.example.com.", "type": "CNAME",
+             "ttl": 300, "rdata": "example.com."},
+        )
+
     def test_subsequent_frames_may_repeat_question(self):
         # 后续帧问题区与首帧相同也合法（帧内偏移随之变化，全部用全名）
         frame1, _ = good_frames()
@@ -459,6 +496,23 @@ class ParseErrorTests(unittest.TestCase):
             + struct.pack("!HH", 252, 1)
         )
         exc = error_of([frame])
+        self.assertEqual(exc.code, "compression_pointer_loop")
+
+    def test_compression_pointer_chain_loop_inside_rdata(self):
+        # NS RDATA 内：ptr(RDATA起始+2) -> ptr(RDATA起始) -> 回起点
+        apex = ptr(12)
+        soa = record(apex, T_SOA, 300,
+                     soa_rdata(b"\x03ns1" + ptr(12), b"\x05admin" + ptr(12)))
+        # 记录体起点 = 12 + 问题(17) + soa(51) = 80
+        rr_start = 12 + len(question()) + len(soa)
+        rdata_start = rr_start + 2 + 10
+        bad_ns = record(
+            ptr(12), T_NS, 300,
+            ptr(rdata_start + 2) + ptr(rdata_start),
+        )
+        frame = header(MID, 1, 2) + question() + soa + bad_ns
+        exc = error_of([frame])
+        self.assertEqual(exc.status, 422)
         self.assertEqual(exc.code, "compression_pointer_loop")
 
     def test_compression_pointer_out_of_bounds(self):
